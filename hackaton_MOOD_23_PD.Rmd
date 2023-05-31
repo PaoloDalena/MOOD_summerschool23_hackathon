@@ -1,0 +1,270 @@
+---
+title: "Hackaton MOOD summer school 2023"
+subtitle: "A - tick occurrences GB"
+author: "Paolo Dalena"
+date: "2023-05-25"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(kableExtra)
+```
+
+
+## Download the data
+
+
+```{r}
+rep = "http://s3.eu-central-1.wasabisys.com/mood/training/"
+rds = url(paste0(rep, "ticks_training_set.rds"))
+train = readRDS(rds)
+
+dim(train)
+```
+
+I have 125 variables, I have to perform a variable reduction, of course. 
+
+```{r}
+names(train)
+```
+
+
+
+## Considerations and plan of analysis
+
+I am a data scientist, I have no idea what information the covariates contain, and I have no knowledge of whether some covariates may be associated with the outcome I want to estimate. Looking at the variable names, however, it seems to me that it is possible that there are redundant variables that contain similar information. It might be interesting to group the variables and eliminate the redundant ones, so as to streamline the analysis from the very beginning.
+I would then like to apply what has been talked about these days, so I would like to apply the Ensemble ML, perhaps weighing with the weights of the coefficients of the meta learners model the most important variables for each candidate model. I will also try to validate my models by considering a spatial CV, to consider *space*, and I will include in the analyses a temporal variable (e.g., the cosine of months), to consider *time*.
+
+For now I have:
+
+- variable clustering;
+- understanding how to consider time in my model;
+- defining folds (?) for Spatial CV;
+- Train the model;
+- building the dataset for testing;
+- fit the results.
+
+**But these are just ideas, then will evaluate based on time.**
+
+Note from 5-hours-later-Paolo: this plan was not followed precisely.
+
+## Minor changes in dataset
+
+I will remove the problematic variable **tick_f**:
+
+```{r}
+train <- train[,names(train) != "tick_f"]
+```
+
+I will also remove the rows with NAs:
+
+```{r}
+train <- na.omit(train)
+```
+
+## Descriptive analysis
+
+Just to have a clearer vision of the dataset.
+
+```{r}
+table(train$Ticks)
+table(train$Ticks==0)
+```
+
+0 and non-0 are perfectly balanced.
+
+
+```{r}
+range(train$Date)
+```
+
+```{r}
+unique(train$Date)
+length(unique(train$Date))
+```
+
+14800 observations from ONLY 93 unique dates! Given this result, it probably does not make sense to spend too much time creating a variable that considers the time trend in the dataset. It may make sense to consider time only to group data, considering seasons, for example, or months Of course, by doing so I lose information about the actual consequentiality of time, but it is probably not a huge loss.
+
+Anyway, I will create a grouping variable and a variable that considers the passing of time so that everything is taken into account.
+
+Grouping variable (months). I will extract the month from the date (that is a fake day, but the month and the year is reliable, as in the variable *Time_step*). For the passing of time I already have the cosmonth variable in the dataset.
+
+```{r}
+train$monthf <- factor(format(train$Date, "%b"))
+plot(table(train$monthf))
+table(round(train$cosmonth,2))
+```
+
+Even if this variable doesn't seem to be so informative, since we have only 7 unique values.
+
+
+## Variable clustering and a-priori variable selection
+
+I will perform a variable clustering considering only the numeric covariates.
+
+```{r}
+library(Hmisc)
+str(train)
+
+# just to check
+res <- numeric(0)
+for(i in 1:124){
+  res[i] <- is.numeric(train[,i])
+}
+res[10:124] == 1
+
+vcl <- varclus(as.matrix(train[,10:124]), similarity = "spear", type = "data.matrix")
+plot(vcl, cex = 0.1, hang = -1)
+```
+
+As expected there are many variables that are merged in the same cluster at a lower level => they contain a similar information => I should perform a variable selection.
+
+In order to exclude redundant variables, I could select the variables that contain 'original' information. But how?
+Let's check the correlations:
+
+```{r}
+library(car)
+library(pROC)
+GGally::ggcorr(cor(train[10:124]), geom = "tile", cex = 0.1)
+```
+
+Let's remove some variables considering correlation coefficients:
+
+```{r}
+to_remove <- caret::findCorrelation(cor(train[,10:124]), cutoff = .6, names = T)
+to_remove
+```
+
+```{r}
+train.sub <- train[!colnames(train) %in% to_remove]
+dim(train.sub)
+```
+
+Let's run the variable clustering again:
+
+```{r}
+vcl <- varclus(as.matrix(train.sub[,10:ncol(train.sub)-1]), similarity = "spear", type = "data.matrix")
+plot(vcl, cex = 0.1, hang = -.1)
+```
+
+## Variable importance considering Boruta algorithm
+
+```{r}
+library(Boruta)
+# boruta <- Boruta(Ticks ~ ., data = train.sub[,-c(1,3,5:9)], doTrace = 2, maxRuns = 100)
+#save(boruta, file = "boruta_pd.rdata")
+load("boruta_pd.rdata")
+print(boruta)
+plot(boruta, las = 2, cex.axis = 0.7, ylim = c(-5,23), xlim = c(1,47))
+
+attStats(boruta)[-1,]%>%
+    dplyr::arrange(desc(meanImp)) %>%
+    knitr::kable(booktabs = T)%>%
+    kable_styling()
+```
+
+I will take a threshold of 10 for the mean importance, so I will keep the following variables:
+
+```{r}
+res <- attStats(boruta)[-1,]%>%
+    dplyr::arrange(desc(meanImp))
+impvars <- rownames(res[1:11,])
+impvars
+
+train.sub2 <- train.sub[, c("Ticks",impvars)]
+```
+
+## Spatial cross validation
+
+```{r}
+# sp <- sf::st_as_sf(train.sub2, coords = c("X", "Y"), crs = 27700)
+# folds <- spatial_clustering_cv(sp, v = 5)
+```
+I have not enough RAM, I have run the code for generating the folds now I will just load the results and extract the row index that identify the observations in the five folds:
+
+```{r}
+load("folds_pd.rdata")
+autoplot(folds)+theme_void()+theme(text = element_text(family = "mono"))
+
+myfolds <- list(folds$splits[[1]]$in_id,
+folds$splits[[2]]$in_id,
+folds$splits[[3]]$in_id,
+folds$splits[[4]]$in_id,
+folds$splits[[5]]$in_id)
+```
+
+
+## Training the model
+
+```{r}
+library(randomForest)
+rmse <- function(a, b) {
+  sqrt(mean((a - b)^2))
+}
+rf = randomForest(train.sub2[,-1], train.sub2$Ticks, nodesize = 5, ntree = 100, keep.inbag = TRUE)
+```
+
+Calculating the RMSE considering the 5 folds spatial cross-validation:
+
+```{r, warning = F}
+totind <- 1:14397
+
+rmse_rf <- 1:5
+rmse_rf2 <- 1:5
+for (i in 1:5) {
+  cat("\nIteration number: ", i)
+  indin <- myfolds[[i]]
+  indout <-totind[!totind%in%indin]
+  iter_rf <- randomForest(train.sub2[indin,-1], train.sub2[indin, "Ticks"], nodesize = 5, ntree = 100)
+  y_hat <- predict(object = iter_rf, newdata = train.sub2[indout,])
+  rmse_rf[i] <- rmse(y_hat, train.sub2[indout, "Ticks"])
+  rmse_rf2[i] <- yardstick::rmse_vec("truth" = train.sub2[indout, "Ticks"], "estimate" = y_hat)
+  cat("\n\nRMSE for iteration", i, ":", rmse_rf[i])
+}
+
+rmse_rf==rmse_rf2
+mean(rmse_rf)
+```
+
+RMSE values seem to me too low, maybe I've done something wrong. But I don't know what. I have included only 11 variables in the model, the following ones (with the first one that is the y):
+```{r}
+names(train.sub2)
+```
+
+I also checked in the for loop if there are problems with the cross-validations folders, and there are no overlaps in the row indexes. I also checked for the calculation of the RMSE, using the classical computation with the code and the function *rmse()* in the yardstick R package. I don't know.
+
+
+
+## Buliding test set
+
+Same as before, I will just load the data with the test set 
+```{r}
+test_df <- readRDS("db_hackaton_test.rds")
+ids <- test_df$Grid_ID
+test_df$monthf <- factor(test_df$monthf, levels = c("ago","apr","dic","feb","gen","giu","lug","mag","mar","nov","ott","set"), labels = c("Aug", "Apr", "Dec", "Feb", "Jan", "Jun", "Jul","May" ,"Mar", "Nov" ,"Oct" ,"Sep"))
+
+
+names(train.sub2)%in%names(test_df)
+names(train.sub2)[3:4]
+names(test_df)[14] <- names(train.sub2)[3]
+names(test_df)[11] <-  names(train.sub2)[4]
+names(train.sub2)%in%names(test_df)
+
+test_df <- test_df[,names(train.sub2)[-1]]
+
+
+y_hat <- predict(object= rf, test_df)
+y_hat <- as.data.frame(cbind(ids, y_hat))
+
+library("writexl")
+write_xlsx(y_hat,"vogliomorire.xlsx")
+```
+
+
+
+
